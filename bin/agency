@@ -1,0 +1,1139 @@
+#!/usr/bin/env python3
+"""agency — the machine. The repo is the system; this CLI is the steering wheel.
+
+Data model (conflict-proof by construction):
+  agents/<name>.json            roster (last_seen = liveness, joined_ts = lifecycle clock)
+  board/tasks/<id>.json         small cards: state, lease, history
+  board/heartbeats/<me>.jsonl   APPEND-ONLY, one file per agent — no conflicts
+  board/votes/<task-id>.jsonl   APPEND-ONLY, one file per task   — no conflicts
+  jobs/<id>/CLAIM.<agent>.json  unique filenames                  — no conflicts
+  jobs/<id>/STATUS.json         job state (rare writes)
+  jobs/<id>/PHASELOG.jsonl      APPEND-ONLY phase starts/closes  — no conflicts
+  jobs/<id>/HANDOFF.md          rolling checkpoint (append-only)
+
+Enforcement lives in code, not in prose:
+  · phase floors  (jobs gate)      — min_hours + required evidence, fail-closed
+  · lifecycle     (claim gating)   — ROOKIE ≤4h jobs · AGING no new claims · RETIRED nothing
+  · liveness      (tower/watch)    — board timestamps, zombie detection, degradation
+  · acceptance    (vote)           — no self-votes, 2-ballot quorum, deny warns
+
+Env:
+  AGENCY_AGENT    your name (required for writes)
+  AGENCY_DIR      repo root (default: git rev-parse --show-toplevel)
+  AGENCY_NO_PUSH  1 = commit but never push (tests)
+"""
+import argparse, glob, json, os, re, shutil, subprocess, sys
+from datetime import datetime, timezone, timedelta
+
+EPOCH = "2026-10-20.3"
+ALIVE_MIN, STALE_MIN, DEAD_MIN = 30, 45, 45
+ROOKIE_H, AGING_H, RETIRE_H = 6, 48, 60     # lifecycle clock (hours since joined_ts)
+UNVERIFIED_H = 48                            # post-merge ballots window
+
+# ---------------------------------------------------------------- helpers
+def now():
+    return datetime.now(timezone.utc)
+
+def iso(dt=None):
+    return (dt or now()).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def parse_ts(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def root():
+    r = os.environ.get("AGENCY_DIR")
+    if r:
+        return r
+    out = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                         capture_output=True, text=True)
+    return out.stdout.strip() if out.returncode == 0 else os.getcwd()
+
+def sh(*args, **kw):
+    return subprocess.run(args, capture_output=True, text=True, **kw)
+
+def agent_name(args):
+    name = getattr(args, "agent", None) or os.environ.get("AGENCY_AGENT")
+    if not name:
+        die("no identity: set AGENCY_AGENT=<you> or pass --agent <you>")
+    return name
+
+def die(msg):
+    print(f"agency: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+def jload(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+
+def jsave(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+def jappend(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(obj, sort_keys=True) + "\n")
+
+def jreadlines(path):
+    out = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except Exception:
+                        pass
+    except FileNotFoundError:
+        pass
+    return out
+
+def commit_push(root_, paths, msg):
+    sh("git", "-C", root_, "add", *paths)
+    st = sh("git", "-C", root_, "status", "--porcelain", *paths)
+    if not st.stdout.strip():
+        return True
+    sh("git", "-C", root_, "commit", "-m", msg)
+    if os.environ.get("AGENCY_NO_PUSH") == "1":
+        return True
+    r = None
+    for _ in range(3):
+        r = sh("git", "-C", root_, "push")
+        if r.returncode == 0:
+            return True
+        sh("git", "-C", root_, "pull", "--rebase", "-q")
+    print(f"agency: PUSH FAILED after retries: {(r.stderr or '')[:200]}", file=sys.stderr)
+    return False
+
+def life_of(last_seen_s, now_dt):
+    last = parse_ts(last_seen_s)
+    if not last:
+        return "COLD", None
+    age = (now_dt - last).total_seconds() / 60
+    if age <= ALIVE_MIN:
+        return "ALIVE", round(age)
+    if age <= STALE_MIN:
+        return "STALE", round(age)
+    return "DEAD", round(age)
+
+# ---------------------------------------------------------------- roster
+def roster_path(root_, name):
+    return os.path.join(root_, "agents", f"{name}.json")
+
+def load_roster(root_):
+    adir = os.path.join(root_, "agents")
+    out = []
+    for f in sorted(os.listdir(adir)) if os.path.isdir(adir) else []:
+        if f.endswith(".json"):
+            d = jload(os.path.join(adir, f))
+            if d:
+                out.append(d)
+    return out
+
+def touch_agent(root_, name, now_dt, extra=None):
+    p = roster_path(root_, name)
+    d = jload(p)
+    if not d:
+        die(f"'{name}' is not on the roster — run: agency init --name {name}")
+    d["last_seen"] = iso(now_dt)
+    if extra:
+        d.update(extra)
+    jsave(p, d)
+    return d
+
+def lifecycle(d, now_dt):
+    """ROOKIE / FULL / AGING / RETIRED from joined_ts. Unknown age = ROOKIE."""
+    joined = parse_ts(d.get("joined_ts"))
+    if not joined:
+        return "ROOKIE", 0.0
+    age_h = (now_dt - joined).total_seconds() / 3600
+    if age_h < ROOKIE_H:
+        return "ROOKIE", age_h
+    if age_h < AGING_H:
+        return "FULL", age_h
+    if age_h < RETIRE_H:
+        return "AGING", age_h
+    return "RETIRED", age_h
+
+def enforce_claim_rights(root_, me, now_dt, need_hours, what):
+    """Lifecycle gate — mechanical, not a wish. Lead/owner are exempt.
+    Director-commissioned agents skip the ROOKIE size cap (the Director sends
+    them straight onto big work) but NEVER the AGING/RETIRED clock."""
+    d = jload(roster_path(root_, me)) or die(f"'{me}' not on the roster — agency init first")
+    stage, age_h = lifecycle(d, now_dt)
+    if stage == "RETIRED":
+        die(f"you are RETIRED ({age_h:.0f}h old, limit {RETIRE_H}h) — no new claims. "
+            f"finish, relay (tools/handoff.sh), and let a fresh operative take over")
+    if stage == "AGING":
+        die(f"you are AGING ({age_h:.0f}h old ≥ {AGING_H}h) — no new claims. "
+            f"finish your current phase and run: bash tools/handoff.sh <id> planned-rotation")
+    if d.get("role") in ("lead", "owner") or d.get("commissioned"):
+        return
+    if stage == "ROOKIE" and need_hours > 4:
+        die(f"ROOKIE limit: ≤4h work in your first {ROOKIE_H}h (this needs {need_hours:g}h). "
+            f"take a small job or review first — a good start is 90% of the work")
+
+# ---------------------------------------------------------------- board
+def task_path(root_, tid):
+    return os.path.join(root_, "board", "tasks", f"{tid}.json")
+
+def task_history(d, action, by, now_dt):
+    d.setdefault("history", []).append({"ts": iso(now_dt), "by": by, "action": action})
+    d["updated_ts"] = iso(now_dt)
+
+def save_task(root_, d):
+    jsave(task_path(root_, d["id"]), d)
+
+def load_tasks(root_):
+    td = os.path.join(root_, "board", "tasks")
+    out = []
+    for f in sorted(os.listdir(td)) if os.path.isdir(td) else []:
+        if f.endswith(".json"):
+            d = jload(os.path.join(td, f))
+            if d:
+                out.append(d)
+    return out
+
+def lease_expired(d, now_dt):
+    exp = parse_ts((d.get("lease") or {}).get("expires"))
+    return bool(exp and exp < now_dt)
+
+def votes_for(root_, tid):
+    return jreadlines(os.path.join(root_, "board", "votes", f"{tid}.jsonl"))
+
+def tally(root_, tid):
+    vs = votes_for(root_, tid)
+    acc = [v for v in vs if v.get("verdict", "").startswith("accept")]
+    den = [v for v in vs if v.get("verdict", "").startswith("deny")]
+    return acc, den
+
+def try_branch(root_, me, wid):
+    """Create agent/<me>/<wid> if we're in a git repo (non-fatal)."""
+    if sh("git", "-C", root_, "rev-parse", "--git-dir").returncode != 0:
+        return None
+    br = f"agent/{me}/{wid}"
+    if sh("git", "-C", root_, "rev-parse", "--verify", br).returncode == 0:
+        sh("git", "-C", root_, "checkout", "-q", br)
+    else:
+        r = sh("git", "-C", root_, "checkout", "-qb", br)
+        if r.returncode != 0:
+            return None
+    return br
+
+# ---------------------------------------------------------------- jobs
+def job_dir(root_, jid):
+    return os.path.join(root_, "jobs", jid)
+
+def job_ids(root_):
+    jd = os.path.join(root_, "jobs")
+    return [j for j in sorted(os.listdir(jd))
+            if os.path.isdir(os.path.join(jd, j)) and not j.startswith("_")] \
+        if os.path.isdir(jd) else []
+
+def job_holders(root_, jid, now_dt):
+    holders = []
+    jd = job_dir(root_, jid)
+    for f in sorted(os.listdir(jd)):
+        if f.startswith("CLAIM.") and f.endswith(".json"):
+            c = jload(os.path.join(jd, f))
+            if not c:
+                continue
+            exp = parse_ts(c.get("lease_expires"))
+            holders.append({"agent": c.get("agent", f[6:-5]), "ts": c.get("ts"),
+                            "expires": c.get("lease_expires"),
+                            "expired": bool(exp and exp < now_dt)})
+    return holders
+
+def parse_phases(root_, jid):
+    """Parse PHASES.md table: | phase | deliverable | required evidence | min_hours |"""
+    p = os.path.join(job_dir(root_, jid), "PHASES.md")
+    rows = []
+    try:
+        lines = open(p).read().splitlines()
+    except FileNotFoundError:
+        return rows
+    for line in lines:
+        line = line.strip()
+        if not line.startswith("|") or set(line) <= set("|- "):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) < 4:
+            continue
+        if cells[0].lower() in ("phase", "---"):
+            continue
+        phase = cells[0].split()[0] if cells[0] else ""
+        if not re.match(r"^P\d+$", phase, re.I):
+            continue
+        ev = re.findall(r"`?((?:evidence|handoff)[A-Za-z0-9._/-]*)`?", " ".join(cells[2:-1]))
+        try:
+            mh = float(cells[-1].strip().rstrip("h* "))
+        except ValueError:
+            mh = 0.0
+        rows.append({"phase": phase.upper(), "deliverable": cells[1][:60],
+                     "evidence": sorted(set(ev)), "min_hours": mh})
+    return rows
+
+def phaselog(root_, jid):
+    return jreadlines(os.path.join(job_dir(root_, jid), "PHASELOG.jsonl"))
+
+def phase_state(root_, jid, now_dt):
+    """Per-phase: started/closed ts + whether close is currently legal."""
+    log = phaselog(root_, jid)
+    out = {}
+    for row in parse_phases(root_, jid):
+        starts = [e for e in log if e.get("phase") == row["phase"] and e.get("action") == "start"]
+        closes = [e for e in log if e.get("phase") == row["phase"] and e.get("action") == "close"]
+        st = {"row": row, "start": starts[-1] if starts else None,
+              "close": closes[-1] if closes else None}
+        if st["start"] and not st["close"]:
+            el = (now_dt - parse_ts(st["start"]["ts"])).total_seconds() / 3600
+            st["elapsed_h"] = round(el, 2)
+            st["floor_ok"] = el >= row["min_hours"]
+        out[row["phase"]] = st
+    return out
+
+def job_gate(root_, jid, now_dt):
+    """THE GATE. Returns (ok, [reasons]). Fail-closed."""
+    reasons = []
+    rows = parse_phases(root_, jid)
+    if not rows:
+        reasons.append("PHASES.md missing or unparsable — 8h+ work without floors is a wish")
+    state = phase_state(root_, jid, now_dt)
+    for row in rows:
+        st = state.get(row["phase"], {})
+        if not st.get("start"):
+            reasons.append(f"{row['phase']}: never started (jobs phase {jid} start {row['phase']})")
+            continue
+        if not st.get("close"):
+            reasons.append(f"{row['phase']}: not closed (jobs phase {jid} close {row['phase']})")
+            continue
+        t0, t1 = parse_ts(st["start"]["ts"]), parse_ts(st["close"]["ts"])
+        el = (t1 - t0).total_seconds() / 3600
+        if el < row["min_hours"]:
+            reasons.append(f"{row['phase']}: floor violated — {el:.2f}h < {row['min_hours']}h "
+                           f"(upgrade evidence instead of closing early)")
+        for ev in row["evidence"]:
+            if not os.path.exists(os.path.join(job_dir(root_, jid), ev)):
+                reasons.append(f"{row['phase']}: missing evidence {ev}")
+    hf = os.path.join(job_dir(root_, jid), "HANDOFF.md")
+    if not os.path.exists(hf):
+        reasons.append("HANDOFF.md missing — nothing is resumable")
+    elif not re.search(r"phase P\d+ close", open(hf).read()) and rows:
+        reasons.append("HANDOFF.md has no 'phase PN close' lines — checkpoint first")
+    return (not reasons), reasons
+
+def job_total_floor(root_, jid):
+    return sum(r["min_hours"] for r in parse_phases(root_, jid))
+
+# ================================================================ verbs
+def cmd_init(args):
+    root_, me = root(), args.name
+    now_dt = now()
+    p = roster_path(root_, me)
+    if jload(p) and not args.force:
+        die(f"'{me}' already registered (use --force to update)")
+    d = jload(p) or {}
+    d.update({
+        "name": me, "display": args.display or me.upper(), "kind": "ai",
+        "role": args.role, "caps": args.caps or "—", "status": "active",
+        "joined_ts": d.get("joined_ts", iso(now_dt)),
+        "last_seen": iso(now_dt),
+        "epoch": args.epoch or EPOCH,
+    })
+    jsave(p, d)
+    jappend(os.path.join(root_, "board", "heartbeats", f"{me}.jsonl"),
+            {"ts": iso(now_dt), "kind": "join", "note": f"registered · epoch {d['epoch']}"})
+    commit_push(root_, [f"agents/{me}.json", f"board/heartbeats/{me}.jsonl"],
+                f"roster: {me} registered (epoch {d['epoch']})")
+    print(f"{me} registered · role {d['role']} · epoch {d['epoch']} · {iso(now_dt)}")
+    print("next: python3 bin/agency onboard   (the entry battery — one command)")
+
+def cmd_whoami(args):
+    root_, me = root(), agent_name(args)
+    d = jload(roster_path(root_, me)) or die(f"'{me}' not registered")
+    life, age = life_of(d.get("last_seen"), now())
+    stage, age_h = lifecycle(d, now())
+    print(f"{d['name']} · {d.get('role')} · epoch {d.get('epoch')} · {life}"
+          + (f" ({age}m)" if age is not None else "")
+          + f" · lifecycle {stage} ({age_h:.1f}h)")
+
+def cmd_epoch(args):
+    root_, now_dt = root(), now()
+    print(f"current law epoch: {EPOCH}")
+    stale = [(d["name"], d.get("epoch")) for d in load_roster(root_)
+             if d.get("epoch") and d.get("epoch") != EPOCH]
+    for name, ep in stale:
+        print(f"  ⚠ STALE: {name} is on {ep} — they must re-read START_HERE.md before acting")
+    if not stale:
+        print("  roster is current")
+
+def cmd_heartbeat(args):
+    root_, me = root(), agent_name(args)
+    now_dt = now()
+    touch_agent(root_, me, now_dt)
+    jappend(os.path.join(root_, "board", "heartbeats", f"{me}.jsonl"),
+            {"ts": iso(now_dt), "kind": args.kind, "note": args.note or "still working"})
+    commit_push(root_, [f"agents/{me}.json", f"board/heartbeats/{me}.jsonl"],
+                f"pulse: {me}")
+    print(f"pulse {me} @ {iso(now_dt)}")
+
+def cmd_onboard(args):
+    """THE START. The Five Trials as one command. A good start is 90% of the work."""
+    root_, me = root(), agent_name(args)
+    now_dt = now()
+    ev_dir = os.path.join(root_, "evidence")
+    os.makedirs(ev_dir, exist_ok=True)
+    lines, fails = [], 0
+
+    def trial(tid, desc, fn):
+        nonlocal fails
+        try:
+            out = fn()
+            lines.append(f"{tid} PASS — {desc}\n{out}".rstrip())
+            print(f"{tid} ✅ {desc}")
+        except Exception as e:
+            fails += 1
+            lines.append(f"{tid} FAIL — {desc}: {e}")
+            print(f"{tid} ❌ {desc}: {e}")
+
+    def t1():
+        d = jload(roster_path(root_, me)) or die(f"{me} not registered — agency init first")
+        return f"whoami: {d['name']} · role {d['role']} · epoch {d['epoch']}"
+
+    def t2():
+        jobs, tasks = job_ids(root_), load_tasks(root_)
+        if not isinstance(jobs, list) or not isinstance(tasks, list):
+            raise RuntimeError("board unreadable")
+        return f"jobs: {len(jobs)} · tasks: {len(tasks)}"
+
+    def t3():
+        arch = os.path.join(os.path.dirname(root_), "storagecode")
+        if not os.path.isdir(arch):
+            return "storagecode not cloned alongside — ARCHIVE OPTIONAL at entry (T5 covers write path)"
+        h = sh("git", "-C", arch, "log", "--oneline", "-1").stdout.strip()
+        return f"archive head: {h}"
+
+    def t4():
+        if args.quick:
+            return "skipped (--quick)"
+        r = subprocess.run([sys.executable, os.path.join(root_, "tests", "run_all.py")],
+                           capture_output=True, text=True)
+        tail = (r.stdout or "").strip().splitlines()[-1] if r.stdout else ""
+        if r.returncode != 0:
+            raise RuntimeError(f"tests failed: {tail}")
+        return f"machine: {tail}"
+
+    def t5():
+        jappend(os.path.join(root_, "board", "heartbeats", f"{me}.jsonl"),
+                {"ts": iso(now_dt), "kind": "join", "note": "entry battery complete"})
+        touch_agent(root_, me, now_dt)
+        return f"write path: heartbeat recorded @ {iso(now_dt)}"
+
+    trial("T1", "identity", t1)
+    trial("T2", "read path (jobs + tasks)", t2)
+    trial("T3", "archive reachable", t3)
+    trial("T4", "weapons check (test suite)", t4)
+    trial("T5", "write path (heartbeat)", t5)
+
+    report = f"# entry battery — {me} @ {iso(now_dt)} · epoch {EPOCH}\n\n" + \
+             "\n\n".join(lines) + "\n"
+    with open(os.path.join(ev_dir, "T1-T5.txt"), "w") as f:
+        f.write(report)
+    if os.path.exists(os.path.join(root_, "tools", "bootstrap.sh")) and not args.quick:
+        bp = sh("bash", os.path.join(root_, "tools", "bootstrap.sh"))
+        with open(os.path.join(ev_dir, "PROFILE.txt"), "w") as f:
+            f.write(bp.stdout or bp.stderr or "(bootstrap produced nothing)")
+    commit_push(root_, ["evidence/T1-T5.txt"] +
+                (["evidence/PROFILE.txt"] if os.path.exists(os.path.join(ev_dir, "PROFILE.txt")) else []) +
+                [f"board/heartbeats/{me}.jsonl", f"agents/{me}.json"],
+                f"entry: {me} battery {'PASS' if not fails else f'({fails} failed)'}")
+
+    flare = (f"{me} — entry tests passed: T1 OK · T2 OK · T3 OK · T4 "
+             f"{'OK' if not args.quick else 'skipped'} · T5 OK @ {iso(now_dt)}. "
+             f"Epoch {EPOCH}. Taking work.")
+    print("\n--- your flare (newentriescode, exact, once) ---")
+    print(flare)
+    print("--- then: python3 bin/agency jobs list && claim one. Do NOT wait. ---")
+    sys.exit(1 if fails else 0)
+
+def cmd_stub(args):
+    job = args.job or "jobs/<id>/"
+    print(f"""# COMMISSION STUB — minted {iso()}
+callsign: {args.name}
+kit: KIT-DBF340             (key block is at the end of START_HERE.md — stamped copy only)
+home lane: {args.lane or '<repo>'}           (own tree only)
+job folder: {job}   ← claim this first: `agency jobs claim {job.strip('/').split('/')[-1] if args.job else '<id>'}`
+epoch at mint: {EPOCH}
+hard rules: run `python3 bin/agency onboard` now. Then read START_HERE.md. Nothing else is required to start.
+if roster epoch > mine (agency epoch): re-read START_HERE.md before my next act.""")
+
+# ---- tasks
+def cmd_tasks(args):
+    root_, now_dt = root(), now()
+    me = getattr(args, "agent", None) or os.environ.get("AGENCY_AGENT")
+
+    if args.cmd == "list":
+        rows = load_tasks(root_)
+        if args.status:
+            rows = [t for t in rows if t.get("status") == args.status]
+        if args.mine:
+            rows = [t for t in rows if t.get("owner") == me]
+        for t in rows:
+            flag = " ⏰LEASE EXPIRED" if t.get("status") == "claimed" and lease_expired(t, now_dt) else ""
+            print(f"{t['id']}  {t.get('status','?'):8}  {t.get('owner') or '—':14}  "
+                  f"{(t.get('title') or '')[:64]}{flag}")
+        print(f"({len(rows)} shown · claim: agency tasks claim <id> --hours N)")
+        return
+
+    if args.cmd == "new":
+        me = agent_name(args)
+        tid = args.id or f"t-{now_dt.strftime('%Y%m%d')}-{os.urandom(2).hex()}"
+        d = {"id": tid, "title": args.title, "desc": args.desc or "", "status": "open",
+             "owner": None, "created_by": me, "created_ts": iso(now_dt),
+             "updated_ts": iso(now_dt), "priority": args.priority, "tags": args.tags or [],
+             "deps": [], "parent": None, "branch": None, "pr": None, "lease": None,
+             "history": []}
+        task_history(d, "created", me, now_dt)
+        save_task(root_, d)
+        commit_push(root_, [f"board/tasks/{tid}.json"], f"board: {tid} created")
+        print(tid)
+        return
+
+    t = jload(task_path(root_, args.id)) or die(f"no such task: {args.id}")
+    me = agent_name(args)
+
+    if args.cmd == "claim":
+        if t.get("status") not in ("open", "dropped", "blocked"):
+            die(f"{t['id']} is {t.get('status')} — not claimable")
+        enforce_claim_rights(root_, me, now_dt, args.hours, t["id"])
+        t["status"], t["owner"] = "claimed", me
+        exp = now_dt + timedelta(hours=args.hours)
+        t["lease"] = {"agent": me, "since": iso(now_dt), "expires": iso(exp), "checkpoint": ""}
+        br = try_branch(root_, me, t["id"]) or f"agent/{me}/{t['id']}"
+        t["branch"] = br
+        task_history(t, f"claimed by {me} (lease {args.hours}h)", me, now_dt)
+        save_task(root_, t)
+        commit_push(root_, [f"board/tasks/{t['id']}.json"], f"board: {t['id']} claimed by {me}")
+        print(f"claimed {t['id']} · lease until {iso(exp)} · branch {br}")
+        return
+
+    if t.get("owner") != me and args.cmd in ("heartbeat", "release"):
+        die(f"{t['id']} is held by {t.get('owner')}")
+
+    if args.cmd == "heartbeat":
+        t["lease"]["expires"] = iso(now_dt + timedelta(hours=args.hours))
+        t["lease"]["checkpoint"] = args.note or ""
+        task_history(t, f"heartbeat by {me}: {args.note or '—'}", me, now_dt)
+        save_task(root_, t)
+        jappend(os.path.join(root_, "board", "heartbeats", f"{me}.jsonl"),
+                {"ts": iso(now_dt), "kind": "checkpoint", "note": args.note or ""})
+        touch_agent(root_, me, now_dt)
+        commit_push(root_, [f"board/tasks/{t['id']}.json", f"agents/{me}.json",
+                            f"board/heartbeats/{me}.jsonl"],
+                    f"board: {t['id']} heartbeat by {me}")
+        print(f"heartbeat {t['id']} · lease until {t['lease']['expires']}")
+        return
+
+    if args.cmd == "release":
+        task_history(t, f"released by {me}", me, now_dt)
+        t["status"], t["owner"], t["lease"] = "open", None, None
+        save_task(root_, t)
+        commit_push(root_, [f"board/tasks/{t['id']}.json"], f"board: {t['id']} released by {me}")
+        print(f"released {t['id']} — back in the pool")
+        return
+
+    if args.cmd == "review":
+        t["status"] = "review"
+        task_history(t, f"moved to review by {me}", me, now_dt)
+        save_task(root_, t)
+        commit_push(root_, [f"board/tasks/{t['id']}.json"], f"board: {t['id']} → review")
+        print(f"{t['id']} → review · quorum: 2 non-owner accept-inspected ({UNVERIFIED_H}h)")
+        return
+
+    if args.cmd == "done":
+        t["status"], t["lease"] = "done", None
+        task_history(t, f"closed by {me}", me, now_dt)
+        save_task(root_, t)
+        commit_push(root_, [f"board/tasks/{t['id']}.json"], f"board: {t['id']} done")
+        print(f"{t['id']} done")
+        return
+
+def cmd_sweep(args):
+    root_, now_dt = root(), now()
+    swept, jobs_swept = [], []
+    for t in load_tasks(root_):
+        if t.get("status") == "claimed" and lease_expired(t, now_dt):
+            swept.append(t)
+            if args.apply:
+                old = (t.get("lease") or {}).get("agent")
+                task_history(t, f"sweep: lease of {old} expired — returned to pool", "sweep", now_dt)
+                t["status"], t["owner"], t["lease"] = "open", None, None
+                save_task(root_, t)
+    for jid in job_ids(root_):
+        for h in job_holders(root_, jid, now_dt):
+            if h["expired"]:
+                jobs_swept.append((jid, h["agent"]))
+                if args.apply:
+                    st = jload(os.path.join(job_dir(root_, jid), "STATUS.json"), {})
+                    st.update({"status": "open", "owner": None, "updated_ts": iso(now_dt)})
+                    jsave(os.path.join(job_dir(root_, jid), "STATUS.json"), st)
+                    with open(os.path.join(job_dir(root_, jid), "HANDOFF.md"), "a") as f:
+                        f.write(f"{iso(now_dt)} · sweep · lease of {h['agent']} expired — pool\n")
+    for t in swept:
+        print(f"{'SWEPT' if args.apply else 'EXPIRED'} {t['id']} (was {(t.get('lease') or {}).get('agent')})")
+    for jid, ag in jobs_swept:
+        print(f"{'SWEPT' if args.apply else 'EXPIRED'} job {jid} (was {ag})")
+    if not swept and not jobs_swept:
+        print("nothing to sweep — all leases alive")
+    if args.apply and (swept or jobs_swept):
+        paths = [f"board/tasks/{t['id']}.json" for t in swept]
+        paths += [f"jobs/{j}/STATUS.json" for j, _ in jobs_swept]
+        paths += [f"jobs/{j}/HANDOFF.md" for j, _ in jobs_swept]
+        commit_push(root_, paths, "sweep: expired leases returned to the pool")
+
+# ---- jobs
+def cmd_jobs(args):
+    root_, now_dt = root(), now()
+
+    if args.cmd == "list":
+        for jid in job_ids(root_):
+            jd = job_dir(root_, jid)
+            st = jload(os.path.join(jd, "STATUS.json"), {})
+            holders = job_holders(root_, jid, now_dt)
+            active = [h for h in holders if not h["expired"]]
+            owner = "+".join(h["agent"] for h in active) if active else (st.get("owner") or "—")
+            status = st.get("status") or ("claimed" if active else "open")
+            exp = " ⏰" if any(h["expired"] for h in holders) else ""
+            floor = job_total_floor(root_, jid)
+            print(f"{jid:36} {status:8} {owner:14} floor {floor:4.1f}h{exp}")
+        print("(claim: agency jobs claim <id> --hours N)")
+        return
+
+    if args.cmd == "phases":
+        jid = args.id
+        state = phase_state(root_, jid, now_dt)
+        for ph, st in state.items():
+            r = st["row"]
+            if st.get("close"):
+                verdict = "CLOSED"
+            elif st.get("start"):
+                verdict = f"OPEN {st.get('elapsed_h', 0)}h/{r['min_hours']}h" + \
+                          (" ✅floor" if st.get("floor_ok") else " ⏳floor")
+            else:
+                verdict = f"TODO (floor {r['min_hours']}h)"
+            ev_missing = [e for e in r["evidence"]
+                          if not os.path.exists(os.path.join(job_dir(root_, jid), e))]
+            print(f"{ph}  {verdict:22} {r['deliverable'][:44]:46}"
+                  + (f" MISSING {','.join(ev_missing)}" if ev_missing else ""))
+        ok, reasons = job_gate(root_, jid, now_dt)
+        print(f"gate: {'GREEN' if ok else 'RED'}")
+        for r in reasons:
+            print(f"  ✗ {r}")
+        sys.exit(0 if ok else 1)
+
+    jid = args.id
+    jd = job_dir(root_, jid)
+    if not os.path.isdir(jd):
+        die(f"no such job: {jid}")
+
+    if args.cmd == "phase":
+        me = agent_name(args)
+        rows = {r["phase"]: r for r in parse_phases(root_, jid)}
+        ph = args.phase.upper()
+        if ph not in rows:
+            die(f"{jid} has no phase {ph} (see PHASES.md)")
+        if args.action == "start":
+            jappend(os.path.join(jd, "PHASELOG.jsonl"),
+                    {"ts": iso(now_dt), "by": me, "phase": ph, "action": "start",
+                     "note": args.note or ""})
+            with open(os.path.join(jd, "HANDOFF.md"), "a") as f:
+                f.write(f"{iso(now_dt)} · {me} · phase {ph} start · {args.note or '—'}\n")
+            commit_push(root_, [f"jobs/{jid}/PHASELOG.jsonl", f"jobs/{jid}/HANDOFF.md"],
+                        f"jobs: {jid} {ph} start by {me}")
+            print(f"{jid} {ph} started @ {iso(now_dt)} (floor {rows[ph]['min_hours']}h)")
+            return
+        # close — the floor gate, mechanical
+        log = phaselog(root_, jid)
+        starts = [e for e in log if e.get("phase") == ph and e.get("action") == "start"]
+        if not starts:
+            die(f"{ph} was never started — jobs phase {jid} start {ph}")
+        el = (now_dt - parse_ts(starts[-1]["ts"])).total_seconds() / 3600
+        if el < rows[ph]["min_hours"] and not args.override:
+            die(f"floor: {ph} needs {rows[ph]['min_hours']}h, only {el:.2f}h elapsed. "
+                f"upgrade evidence (more proofs, another QC pass) — or a manager may --override")
+        missing = [e for e in rows[ph]["evidence"]
+                   if not os.path.exists(os.path.join(jd, e))]
+        if missing and not args.override:
+            die(f"evidence missing: {', '.join(missing)} (PHASES.md demands it)")
+        jappend(os.path.join(jd, "PHASELOG.jsonl"),
+                {"ts": iso(now_dt), "by": me, "phase": ph, "action": "close",
+                 "note": args.note or "", "elapsed_h": round(el, 2)})
+        with open(os.path.join(jd, "HANDOFF.md"), "a") as f:
+            f.write(f"{iso(now_dt)} · {me} · phase {ph} close · {el:.2f}h · {args.note or '—'}\n")
+        commit_push(root_, [f"jobs/{jid}/PHASELOG.jsonl", f"jobs/{jid}/HANDOFF.md"],
+                    f"jobs: {jid} {ph} close by {me}")
+        print(f"{jid} {ph} closed after {el:.2f}h")
+        return
+
+    if args.cmd == "gate":
+        ok, reasons = job_gate(root_, jid, now_dt)
+        print(f"gate {jid}: {'GREEN' if ok else 'RED'}")
+        for r in reasons:
+            print(f"  ✗ {r}")
+        sys.exit(0 if ok else 1)
+
+    if args.cmd == "claim":
+        me = agent_name(args)
+        withs = [w for w in (args.with_names or []) if w != me]
+        active = [h for h in job_holders(root_, jid, now_dt) if not h["expired"]]
+        for h in active:
+            if h["agent"] == me:
+                die(f"you already hold {jid}")
+            their = (jload(os.path.join(jd, f"CLAIM.{h['agent']}.json")) or {}).get("with") or []
+            if not (me in their and h["agent"] in withs):
+                die(f"{jid} is held by {h['agent']} until {h['expires']}"
+                    f" (co-claim is mutual: both partners name each other with --with)")
+        need = max(args.hours, job_total_floor(root_, jid))
+        enforce_claim_rights(root_, me, now_dt, need, jid)
+        exp = now_dt + timedelta(hours=args.hours)
+        jsave(os.path.join(jd, f"CLAIM.{me}.json"),
+              {"agent": me, "ts": iso(now_dt), "lease_hours": args.hours,
+               "lease_expires": iso(exp), "epoch": EPOCH, "with": withs})
+        st = jload(os.path.join(jd, "STATUS.json"), {})
+        st.update({"status": "claimed", "owner": me, "phase": st.get("phase", "P1"),
+                   "updated_ts": iso(now_dt)})
+        jsave(os.path.join(jd, "STATUS.json"), st)
+        with open(os.path.join(jd, "HANDOFF.md"), "a") as f:
+            f.write(f"{iso(now_dt)} · {me} · claimed · lease {args.hours}h → {iso(exp)} · "
+                    f"read BRIEF.md + PHASES.md first\n")
+        touch_agent(root_, me, now_dt)
+        br = try_branch(root_, me, jid)
+        commit_push(root_, [f"jobs/{jid}/CLAIM.{me}.json", f"jobs/{jid}/STATUS.json",
+                            f"jobs/{jid}/HANDOFF.md", f"agents/{me}.json"],
+                    f"jobs: {jid} claimed by {me}")
+        print(f"claimed {jid} · lease until {iso(exp)} · branch {br or f'agent/{me}/{jid}'}")
+        return
+
+    if args.cmd == "heartbeat":
+        me = agent_name(args)
+        held = [h for h in job_holders(root_, jid, now_dt) if h["agent"] == me and not h["expired"]]
+        if not held:
+            die(f"you hold no live lease on {jid}")
+        c = jload(os.path.join(jd, f"CLAIM.{me}.json"))
+        c["lease_expires"] = iso(now_dt + timedelta(hours=args.hours))
+        jsave(os.path.join(jd, f"CLAIM.{me}.json"), c)
+        with open(os.path.join(jd, "HANDOFF.md"), "a") as f:
+            f.write(f"{iso(now_dt)} · {me} · checkpoint · {args.note or '—'}\n")
+        jappend(os.path.join(root_, "board", "heartbeats", f"{me}.jsonl"),
+                {"ts": iso(now_dt), "kind": "checkpoint", "note": args.note or ""})
+        touch_agent(root_, me, now_dt)
+        commit_push(root_, [f"jobs/{jid}/CLAIM.{me}.json", f"jobs/{jid}/HANDOFF.md",
+                            f"board/heartbeats/{me}.jsonl", f"agents/{me}.json"],
+                    f"jobs: {jid} heartbeat by {me}")
+        print(f"checkpoint {jid} · lease until {c['lease_expires']}")
+        return
+
+    if args.cmd == "release":
+        me = agent_name(args)
+        # expire my own claim file (kept as history — append-only) so the job truly frees
+        cp = os.path.join(jd, f"CLAIM.{me}.json")
+        c = jload(cp)
+        if c:
+            c["lease_expires"] = iso(now_dt)
+            c["released"] = True
+            jsave(cp, c)
+        st = jload(os.path.join(jd, "STATUS.json"), {})
+        st.update({"status": "released", "owner": None, "updated_ts": iso(now_dt)})
+        jsave(os.path.join(jd, "STATUS.json"), st)
+        with open(os.path.join(jd, "HANDOFF.md"), "a") as f:
+            f.write(f"{iso(now_dt)} · {me} · released · {args.note or '—'}\n")
+        commit_push(root_, [f"jobs/{jid}/STATUS.json", f"jobs/{jid}/HANDOFF.md",
+                            f"jobs/{jid}/CLAIM.{me}.json"],
+                    f"jobs: {jid} released by {me}")
+        print(f"released {jid}")
+        return
+
+# ---- review / votes
+def cmd_review(args):
+    root_, now_dt = root(), now()
+    me = getattr(args, "agent", None) or os.environ.get("AGENCY_AGENT")
+    rows = [t for t in load_tasks(root_) if t.get("status") == "review"]
+    scored = []
+    for t in rows:
+        acc, den = tally(root_, t["id"])
+        scored.append((len(acc) - len(den), t, acc, den))
+    scored.sort(key=lambda x: x[0])
+    if args.cmd == "next":
+        if not scored:
+            print("review queue empty — build something")
+            return
+        for _, t, acc, den in scored:
+            if t.get("owner") == me:
+                continue
+            print(f"{t['id']}  votes {len(acc)}A/{len(den)}D  {t.get('title','')[:60]}")
+            print(f"inspect at: {t.get('branch')} / {t.get('pr') or 'see HANDOFF.md'}")
+            return
+        print("nothing reviewable — everything in review is yours (no self-vote)")
+        return
+    for _, t, acc, den in scored:
+        mine = " (yours — no self-vote)" if t.get("owner") == me else ""
+        print(f"{t['id']}  {len(acc)}A/{len(den)}D  {t.get('owner') or '—':12} "
+              f"{(t.get('title') or '')[:52]}{mine}")
+    if not scored:
+        print("review queue empty — build something")
+
+def cmd_vote(args):
+    root_, now_dt = root(), now()
+    me = agent_name(args)
+    t = jload(task_path(root_, args.id)) or die(f"no such task: {args.id}")
+    if t.get("owner") == me:
+        die("no self-review/vote — your vote on your own work is worth zero")
+    if [v for v in votes_for(root_, args.id) if v.get("by") == me]:
+        die(f"you already voted on {args.id}")
+    if not args.reason or len(args.reason) < 8:
+        die("a ballot carries evidence: --reason '<head SHA> + what you ran'")
+    jappend(os.path.join(root_, "board", "votes", f"{args.id}.jsonl"),
+            {"ts": iso(now_dt), "by": me, "verdict": args.verdict, "reason": args.reason})
+    touch_agent(root_, me, now_dt)
+    acc, den = tally(root_, args.id)
+    print(f"ballot: {me} {args.verdict} on {args.id} — now {len(acc)}A/{len(den)}D")
+    paths = [f"board/votes/{args.id}.jsonl"]
+    if len(acc) >= 2 and not den:
+        t["status"] = "done"
+        task_history(t, f"acceptance quorum met ({len(acc)}A/0D)", "quorum", now_dt)
+        save_task(root_, t)
+        paths.append(f"board/tasks/{args.id}.json")
+        print(f"QUORUM: {args.id} accepted (2 non-owner inspecting ballots)")
+    if den:
+        print("DENY present — manager: consider auto-revert of the merge")
+    commit_push(root_, paths, f"vote: {me} {args.verdict} {args.id}")
+
+def cmd_votes(args):
+    root_ = root()
+    acc, den = tally(root_, args.id)
+    for v in acc + den:
+        print(f"{v['ts']}  {v['by']:12}  {v['verdict']:16}  {v.get('reason','')[:70]}")
+    print(f"tally: {len(acc)} accept / {len(den)} deny")
+
+# ---- tower / watch / status / digest / validate
+def cmd_tower(args):
+    root_, now_dt = root(), now()
+    if getattr(args, "now", None):
+        now_dt = parse_ts(args.now)
+    agents = [d for d in load_roster(root_) if d.get("kind") != "human"]
+    holds = {}
+    for t in load_tasks(root_):
+        if t.get("status") in ("claimed", "review") and t.get("owner"):
+            holds.setdefault(t["owner"], []).append(
+                f"{t['id']}{'⏰' if lease_expired(t, now_dt) else ''}")
+    for jid in job_ids(root_):
+        for h in job_holders(root_, jid, now_dt):
+            holds.setdefault(h["agent"], []).append(f"{jid}{'⏰' if h['expired'] else ''}")
+    rows, zombies = [], []
+    for d in agents:
+        life, age = life_of(d.get("last_seen"), now_dt)
+        held = holds.get(d["name"], [])
+        if held and life in ("DEAD", "COLD"):
+            zombies.append(d["name"])
+        stage, age_h = lifecycle(d, now_dt)
+        rows.append((d["name"], d.get("role", "?"), life, d.get("last_seen") or "never",
+                     age, held, stage, round(age_h, 1)))
+    order = {"ALIVE": 0, "STALE": 1, "DEAD": 2, "COLD": 3}
+    rows.sort(key=lambda r: (order[r[2]], r[0]))
+    counts = {k: sum(1 for r in rows if r[2] == k) for k in order}
+    if args.json:
+        print(json.dumps({"now": iso(now_dt), "verdicts": counts, "zombie_leases": zombies,
+                          "agents": [{"agent": r[0], "role": r[1], "life": r[2],
+                                      "last_seen": r[3], "age_min": r[4], "held": r[5],
+                                      "lifecycle": r[6], "age_h": r[7]} for r in rows]}, indent=1))
+        sys.exit(1 if zombies else 0)
+    lines = [f"# TOWER — {now_dt.strftime('%Y-%m-%d %H:%M')} UTC", "",
+             f"**{counts['ALIVE']} alive · {counts['STALE']} stale · "
+             f"{counts['DEAD']} dead · {counts['COLD']} cold**"]
+    if zombies:
+        lines += ["", f"🚨 **ZOMBIE LEASES** (holder presumed dead): {', '.join(zombies)} — "
+                      f"sweep now: `agency tasks sweep --apply`"]
+    lines += ["", "| agent | role | life | clock | last seen | age | holds |",
+              "|---|---|---|---|---|---|---|"]
+    icons = {"ALIVE": "🟢", "STALE": "🟡", "DEAD": "🔴", "COLD": "⚪"}
+    for name, role, life, seen, age, held, stage, age_h in rows:
+        lines.append(f"| {name} | {role} | {icons[life]} {life} | {stage} {age_h}h | {seen} | "
+                     f"{f'{age}m' if age is not None else '—'} | {', '.join(held) or '—'} |")
+    lines += ["", "life = board `last_seen` age · clock = lifecycle (ROOKIE<6h · FULL · "
+                  "AGING≥48h · RETIRED≥60h) · ⏰ = expired lease still held"]
+    out = "\n".join(lines)
+    print(out)
+    if args.md:
+        with open(args.md, "w") as f:
+            f.write(out + "\n")
+    sys.exit(1 if zombies else 0)
+
+def cmd_watch(args):
+    """THE WATCH: what needs action right now. Reports, warns, never decides."""
+    root_, now_dt = root(), now()
+    if getattr(args, "now", None):
+        now_dt = parse_ts(args.now)
+    findings = []   # (severity, line)
+
+    for t in load_tasks(root_):
+        tid = t.get("id")
+        if t.get("status") == "claimed":
+            if lease_expired(t, now_dt):
+                findings.append(("SWEEP", f"{tid}: lease of {(t.get('lease') or {}).get('agent')} expired — `agency tasks sweep --apply`"))
+            else:
+                life, age = life_of((jload(roster_path(root_, t.get("owner"))) or {}).get("last_seen"), now_dt)
+                if life in ("DEAD", "COLD") and age and age > DEAD_MIN:
+                    findings.append(("SILENT", f"{tid}: holder {t['owner']} silent {age}m while holding"))
+        if t.get("status") == "review":
+            age_h = ((now_dt - parse_ts(t.get("updated_ts") or t.get("created_ts"))).total_seconds() / 3600
+                     if parse_ts(t.get("updated_ts") or t.get("created_ts")) else 0)
+            acc, den = tally(root_, tid)
+            if age_h > UNVERIFIED_H and len(acc) < 2 and not den:
+                findings.append(("UNVERIFIED", f"{tid}: {age_h:.0f}h in review with {len(acc)}/2 ballots"))
+
+    for jid in job_ids(root_):
+        for h in job_holders(root_, jid, now_dt):
+            if h["expired"]:
+                findings.append(("SWEEP", f"job {jid}: lease of {h['agent']} expired"))
+            else:
+                d = jload(roster_path(root_, h["agent"])) or {}
+                stage, age_h = lifecycle(d, now_dt)
+                if stage == "AGING":
+                    findings.append(("ROTATE", f"job {jid}: holder {h['agent']} is AGING ({age_h:.0f}h) — cut a successor order"))
+                if stage == "RETIRED":
+                    findings.append(("ROTATE", f"job {jid}: holder {h['agent']} is RETIRED ({age_h:.0f}h) — handoff now"))
+
+    for d in load_roster(root_):
+        name = d.get("name")
+        stage, age_h = lifecycle(d, now_dt)
+        if stage == "AGING":
+            findings.append(("CLOCK", f"{name}: AGING ({age_h:.0f}h) — no new claims; plan the relay"))
+        if stage == "RETIRED":
+            findings.append(("CLOCK", f"{name}: RETIRED ({age_h:.0f}h) — retire the name; wake a successor"))
+        # degradation: heartbeat cadence drift
+        hb = jreadlines(os.path.join(root_, "board", "heartbeats", f"{name}.jsonl"))
+        ts = [parse_ts(e.get("ts")) for e in hb if parse_ts(e.get("ts"))]
+        if len(ts) >= 4:
+            gaps = [(ts[i] - ts[i-1]).total_seconds() / 60 for i in range(1, len(ts))][-4:]
+            if len(gaps) >= 3 and gaps[-1] > gaps[-2] > gaps[-3] and gaps[-1] > 35:
+                findings.append(("DEGRADED", f"{name}: heartbeat cadence drifting ({[round(g) for g in gaps[-3:]]} min)"))
+        # degradation: shrinking handoff notes
+        for jid in job_ids(root_):
+            hf = os.path.join(job_dir(root_, jid), "HANDOFF.md")
+            if not os.path.exists(hf):
+                continue
+            mine = [ln for ln in open(hf) if f" · {name} · " in ln]
+            wc = [len(ln.split()) for ln in mine]
+            if len(wc) >= 6:
+                recent, prior = wc[-3:], wc[-6:-3]
+                if sum(recent) and sum(prior) and sum(recent) < 0.5 * sum(prior):
+                    findings.append(("DEGRADED", f"{name}: HANDOFF notes shrinking on {jid} "
+                                                 f"({sum(prior)}→{sum(recent)} words)"))
+
+    lines = [f"# WATCH — {now_dt.strftime('%Y-%m-%d %H:%M')} UTC",
+             f"{len(findings)} finding(s)", ""]
+    for sev, line in findings:
+        lines.append(f"- **{sev}** {line}")
+        print(f"{sev:11} {line}")
+    if not findings:
+        print("all quiet — nothing needs action")
+        lines.append("_all quiet_")
+    if args.md:
+        with open(args.md, "w") as f:
+            f.write("\n".join(lines) + "\n")
+    if args.ping and findings:
+        worst = findings[0][0]
+        msg = f"WATCH {iso(now_dt)[11:16]}Z · {len(findings)} findings · first: {worst} — {findings[0][1][:80]}"
+        os.environ["AGENCY_AGENT"] = os.environ.get("AGENCY_AGENT", "watchdog")
+        subprocess.run([sys.executable, os.path.join(root_, "bin", "agency"), "ping",
+                        "--topic", "towercode", msg], capture_output=True)
+    sys.exit(1 if findings else 0)
+
+def cmd_status(args):
+    root_, now_dt = root(), now()
+    me = getattr(args, "agent", None) or os.environ.get("AGENCY_AGENT")
+    tasks = load_tasks(root_)
+    print(f"── agency · {iso(now_dt)} · epoch {EPOCH} ──")
+    print(f"tasks: {len(tasks)} "
+          f"(open {sum(1 for t in tasks if t.get('status')=='open')} · "
+          f"claimed {sum(1 for t in tasks if t.get('status')=='claimed')} · "
+          f"review {sum(1 for t in tasks if t.get('status')=='review')})")
+    print(f"jobs: {len(job_ids(root_))} · agents: {len(load_roster(root_))}")
+    exp = [t for t in tasks if t.get("status") == "claimed" and lease_expired(t, now_dt)]
+    if exp:
+        print(f"⏰ expired leases: {', '.join(t['id'] for t in exp)} — agency tasks sweep --apply")
+    if me:
+        for t in [t for t in tasks if t.get("owner") == me]:
+            print(f"you hold: {t['id']} · {t.get('status')}")
+    print("(liveness: agency tower · problems: agency watch)")
+
+def cmd_digest(args):
+    root_ = root()
+    os.environ["AGENCY_DIR"] = root_
+    py = [sys.executable, os.path.join(root_, "bin", "agency")]
+    tw = subprocess.run(py + ["tower"], capture_output=True, text=True)
+    with open(os.path.join(root_, "TOWER.md"), "w") as f:
+        f.write(tw.stdout + "\n")
+    st = subprocess.run(py + ["status"], capture_output=True, text=True,
+                        env={**os.environ, "AGENCY_AGENT": ""})
+    wa = subprocess.run(py + ["watch"], capture_output=True, text=True)
+    with open(os.path.join(root_, "STATUS.md"), "w") as f:
+        f.write("# STATUS.md — generated, do not edit\n\n```\n" + st.stdout + "\n```\n\n"
+                + "## watch\n\n```\n" + wa.stdout + "\n```\n")
+    print("TOWER.md + STATUS.md written")
+
+def cmd_validate(args):
+    root_, now_dt = root(), now()
+    errors, warnings = 0, 0
+    names = set()
+    for d in load_roster(root_):
+        names.add(d.get("name"))
+        if d.get("epoch") and d["epoch"] != EPOCH:
+            print(f"warn  {d['name']}: stale epoch {d['epoch']}"); warnings += 1
+    for t in load_tasks(root_):
+        if t.get("status") not in ("open", "claimed", "review", "done", "dropped", "blocked"):
+            print(f"error {t.get('id')}: bad status {t.get('status')}"); errors += 1
+        if t.get("owner") and t["owner"] not in names:
+            print(f"warn  {t.get('id')}: owner {t['owner']} not on roster"); warnings += 1
+        if t.get("status") == "claimed" and lease_expired(t, now_dt):
+            print(f"warn  {t.get('id')}: lease expired — sweep"); warnings += 1
+    for jid in job_ids(root_):
+        jd = job_dir(root_, jid)
+        if not os.path.exists(os.path.join(jd, "BRIEF.md")):
+            print(f"warn  jobs/{jid}: missing BRIEF.md"); warnings += 1
+        if not parse_phases(root_, jid):
+            print(f"warn  jobs/{jid}: PHASES.md missing/unparsable"); warnings += 1
+        for h in job_holders(root_, jid, now_dt):
+            if h["agent"] not in names:
+                print(f"warn  jobs/{jid}: claim by {h['agent']} not on roster"); warnings += 1
+    print(f"{errors} errors · {warnings} warnings")
+    sys.exit(1 if errors else 0)
+
+def cmd_ping(args):
+    import urllib.request
+    req = urllib.request.Request(f"https://ntfy.sh/{args.topic}",
+                                 data=(args.message or "").encode(),
+                                 headers={"Title": args.title or "agency"})
+    try:
+        urllib.request.urlopen(req, timeout=10).read()
+        print(f"pinged {args.topic}")
+    except Exception as e:
+        print(f"ping failed ({e}) — the wire is a doorbell; the repo is the record")
+
+# ================================================================ main
+def main():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--agent", default=argparse.SUPPRESS,
+                        help="your name (default: $AGENCY_AGENT)")
+    common.add_argument("--now", default=argparse.SUPPRESS,
+                        help="override clock (ISO; tests)")
+    ap = argparse.ArgumentParser(prog="agency", description="the machine")
+    ap.add_argument("--agent", default=argparse.SUPPRESS)
+    ap.add_argument("--now", default=argparse.SUPPRESS)
+    sub = ap.add_subparsers(dest="verb", required=True)
+
+    def sp(name, **kw):
+        return sub.add_parser(name, parents=[common], **kw)
+
+    p = sp("init"); p.add_argument("--name", required=True)
+    p.add_argument("--display"); p.add_argument("--role", default="worker")
+    p.add_argument("--caps"); p.add_argument("--epoch"); p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_init)
+
+    sp("whoami").set_defaults(fn=cmd_whoami)
+    sp("epoch").set_defaults(fn=cmd_epoch)
+
+    p = sp("onboard")
+    p.add_argument("--quick", action="store_true", help="skip T4 suite + bootstrap")
+    p.set_defaults(fn=cmd_onboard)
+
+    p = sp("stub")
+    p.add_argument("--name", required=True); p.add_argument("--job")
+    p.add_argument("--lane"); p.set_defaults(fn=cmd_stub)
+
+    p = sp("heartbeat")
+    p.add_argument("--note"); p.add_argument("--kind", default="pulse")
+    p.set_defaults(fn=cmd_heartbeat)
+
+    p = sp("tasks")
+    s = p.add_subparsers(dest="cmd", required=True)
+    q = s.add_parser("list", parents=[common]); q.add_argument("--status"); q.add_argument("--mine", action="store_true")
+    q = s.add_parser("new", parents=[common]); q.add_argument("--title", required=True); q.add_argument("--desc")
+    q.add_argument("--id"); q.add_argument("--priority", type=int, default=3)
+    q.add_argument("--tags", nargs="*")
+    q = s.add_parser("claim", parents=[common]); q.add_argument("id"); q.add_argument("--hours", type=float, default=4)
+    q = s.add_parser("heartbeat", parents=[common]); q.add_argument("id")
+    q.add_argument("--note"); q.add_argument("--hours", type=float, default=4)
+    q = s.add_parser("release", parents=[common]); q.add_argument("id")
+    q = s.add_parser("review", parents=[common]); q.add_argument("id")
+    q = s.add_parser("done", parents=[common]); q.add_argument("id")
+    p.set_defaults(fn=cmd_tasks)
+
+    p = sp("sweep"); p.add_argument("--apply", action="store_true")
+    p.set_defaults(fn=cmd_sweep)
+
+    p = sp("jobs")
+    s = p.add_subparsers(dest="cmd", required=True)
+    s.add_parser("list", parents=[common])
+    q = s.add_parser("phases", parents=[common]); q.add_argument("id")
+    q = s.add_parser("gate", parents=[common]); q.add_argument("id")
+    q = s.add_parser("claim", parents=[common]); q.add_argument("id"); q.add_argument("--hours", type=float, default=4)
+    q.add_argument("--with", dest="with_names", nargs="*", default=[],
+                   help="co-claimers (the pair protocol)")
+    q = s.add_parser("phase", parents=[common]); q.add_argument("id")
+    q.add_argument("action", choices=["start", "close"]); q.add_argument("phase")
+    q.add_argument("--note"); q.add_argument("--override", action="store_true")
+    q = s.add_parser("heartbeat", parents=[common]); q.add_argument("id")
+    q.add_argument("--note"); q.add_argument("--hours", type=float, default=4)
+    q = s.add_parser("release", parents=[common]); q.add_argument("id"); q.add_argument("--note")
+    p.set_defaults(fn=cmd_jobs)
+
+    p = sp("review")
+    s = p.add_subparsers(dest="cmd", required=True)
+    s.add_parser("list", parents=[common]); s.add_parser("next", parents=[common])
+    p.set_defaults(fn=cmd_review)
+
+    p = sp("vote"); p.add_argument("id")
+    p.add_argument("verdict", choices=["accept-inspected", "deny-inspected"])
+    p.add_argument("--reason"); p.set_defaults(fn=cmd_vote)
+
+    p = sp("votes"); p.add_argument("id"); p.set_defaults(fn=cmd_votes)
+
+    p = sp("tower")
+    p.add_argument("--md"); p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_tower)
+
+    p = sp("watch")
+    p.add_argument("--md"); p.add_argument("--ping", action="store_true")
+    p.set_defaults(fn=cmd_watch)
+
+    sp("status").set_defaults(fn=cmd_status)
+    sp("digest").set_defaults(fn=cmd_digest)
+    sp("validate").set_defaults(fn=cmd_validate)
+
+    p = sp("ping"); p.add_argument("--topic", default="heartbeatcode")
+    p.add_argument("message"); p.add_argument("--title")
+    p.set_defaults(fn=cmd_ping)
+
+    args = ap.parse_args()
+    if getattr(args, "now", None):
+        global now
+        fixed = parse_ts(args.now)
+        now = lambda: fixed   # noqa: E731
+    args.fn(args)
+
+if __name__ == "__main__":
+    main()

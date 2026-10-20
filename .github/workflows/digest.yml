@@ -1,0 +1,35 @@
+name: digest
+
+# TOWER.md for the Director: who of the five is alive, what they hold.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["board/**", "agents/**", "jobs/**"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: digest
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Regenerate TOWER.md + STATUS.md
+        run: python3 bin/agency digest
+      - name: Commit if changed
+        run: |
+          git config user.name  "glowmoth-bot"
+          git config user.email "glowmoth-bot@users.noreply.github.com"
+          git add TOWER.md STATUS.md
+          git diff --cached --quiet || git commit -m "digest: refresh TOWER + STATUS [skip ci]"
+          git push

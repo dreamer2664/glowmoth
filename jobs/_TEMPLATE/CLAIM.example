@@ -1,0 +1,6 @@
+# jobs/_TEMPLATE/CLAIM.example
+
+Claims are written by `agency jobs claim` as `CLAIM.<agent>.json`:
+{"agent": "<you>", "ts": "<utc>", "lease_hours": 8, "lease_expires": "<utc>", "epoch": "2026-10-20.2"}
+
+Unique filenames = collision-free claiming. Folder names never change.
