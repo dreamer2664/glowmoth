@@ -1,7 +1,7 @@
 # STATUS.md — generated, do not edit
 
 ```
-── agency · 2026-10-26T18:48:07Z · epoch 2026-10-20.3 ──
+── agency · 2026-10-26T23:01:48Z · epoch 2026-10-20.3 ──
 tasks: 0 (open 0 · claimed 0 · review 0)
 jobs: 4 · agents: 5
 (liveness: agency tower · problems: agency watch)
